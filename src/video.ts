@@ -1,4 +1,9 @@
 import Ffmpeg from "fluent-ffmpeg";
+import { imageSize } from "image-size";
+import type { ISizeCalculationResult } from "image-size/dist/types/interface";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
 	Observable,
 	Subject,
@@ -9,20 +14,28 @@ import {
 	from,
 	map,
 	switchMap,
-	tap,
 } from "rxjs";
-import * as fs from "node:fs";
-import * as path from "node:path";
-import * as os from "node:os";
-import { createScheduler, createWorker } from "tesseract.js";
-import type { FrameData, TruncationOptions } from "./interface";
+import {
+	PSM,
+	createScheduler,
+	createWorker,
+	type Rectangle,
+	type Scheduler,
+} from "tesseract.js";
+import type { AudioData, FrameData } from "./interface";
+import { Lyric } from "./lyric";
 
 export function truncate(
 	filePath: string,
 	outputPath: string,
-	options: TruncationOptions,
+	options: AudioData,
 ): Observable<void> {
 	return new Observable((observer) => {
+		const lyric = new Lyric(options.lyric);
+		lyric.generateFile(outputPath.replace(".mp3", ".lrc"));
+
+		console.log("Truncating...");
+
 		Ffmpeg(filePath)
 			.setStartTime(options.startTime)
 			.setDuration(options.duration)
@@ -33,6 +46,8 @@ export function truncate(
 				if (err) {
 					observer.error(err);
 				} else {
+					lyric.update(outputPath);
+
 					observer.next();
 				}
 
@@ -55,6 +70,8 @@ function videoToImages(
 	outputDirectory: string,
 ): Observable<void> {
 	const progress$ = new Subject<number>();
+
+	console.log("Parsing...");
 
 	const subscription = progress$
 		.pipe(
@@ -92,44 +109,74 @@ function videoToImages(
 function parseVideoFromImages(
 	outputDirectory: string,
 ): Observable<FrameData[]> {
-	const scheduler = createScheduler();
+	return from(getScheduler()).pipe(
+		switchMap((scheduler) => {
+			let size: ISizeCalculationResult;
 
-	console.log("Parsing video...");
-
-	return forkJoin(
-		Array(os.cpus().length)
-			.fill(0)
-			.map(() => {
-				return from(createWorker("eng")).pipe(
-					tap((worker) => {
-						scheduler.addWorker(worker);
-					}),
-				);
-			}),
-	).pipe(
-		switchMap(() => {
 			return forkJoin(
 				Array(countTotalTime(outputDirectory))
 					.fill(0)
 					.map((_, i) => {
 						const imagePath = path.join(outputDirectory, `${i + 1}.png`);
 
-						return scheduler.addJob("recognize", imagePath).then((result) => {
-							return {
-								imagePath,
-								text: result.data.text,
-								timestamp: i,
-							};
-						});
-					}),
-			).pipe(map((data) => data.sort((a, b) => a.timestamp - b.timestamp)));
-		}),
-		finalize(() => {
-			scheduler.terminate();
+						if (!size) {
+							size = imageSize(imagePath);
+						}
 
-			fs.rmSync(outputDirectory, { recursive: true });
+						let rectangle: Rectangle | undefined = undefined;
+
+						if (size.width && size.height) {
+							const top = size.height * 0.1;
+							const height = size.height - top;
+							rectangle = {
+								top,
+								left: 0,
+								width: size.width,
+								height: height,
+							};
+						}
+
+						return scheduler
+							.addJob("recognize", imagePath, {
+								rectangle,
+							})
+							.then((result) => {
+								return {
+									imagePath,
+									rawText: result.data.text,
+									timestamp: i,
+								};
+							});
+					}),
+			).pipe(
+				map((data) => data.sort((a, b) => a.timestamp - b.timestamp)),
+				finalize(() => {
+					scheduler.terminate();
+
+					fs.rmSync(outputDirectory, { recursive: true });
+				}),
+			);
 		}),
 	);
+}
+
+async function getScheduler(): Promise<Scheduler> {
+	const scheduler = createScheduler();
+
+	for (let i = 0; i < os.cpus().length; i++) {
+		const worker = await createWorker("eng");
+
+		await worker.setParameters({
+			tessedit_char_whitelist:
+				"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.,?! ",
+			preserve_interword_spaces: "1",
+			tessedit_pageseg_mode: PSM.SINGLE_BLOCK,
+		});
+
+		scheduler.addWorker(worker);
+	}
+
+	return scheduler;
 }
 
 function countTotalTime(outputDirectory: string): number {

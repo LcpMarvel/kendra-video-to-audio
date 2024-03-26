@@ -22,7 +22,7 @@ parseVideo(filePath)
 				split(data, sentencesCount).map((option, index) => {
 					return truncate(
 						filePath,
-						`${outputPath}/${fileName}-${index + 1}.${fileExtension}`,
+						`${outputPath}/${fileName}-${index + 1}.mp3`,
 						option,
 					);
 				}),
